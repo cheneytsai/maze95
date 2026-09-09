@@ -247,6 +247,13 @@ body.playing #crosshair{opacity:1}
 #log p{margin:0; white-space:pre-wrap; word-break:break-word}
 #log .t{color:#7a7a7a}
 #log .err{color:#ff6b6b}
+#ask-out{
+  margin-top:8px; padding:6px 7px; min-height:52px; max-height:190px; overflow:auto;
+  background:var(--field); color:var(--ink); font-size:11px; line-height:1.45; white-space:pre-wrap;
+  box-shadow:inset 1px 1px 0 var(--shadow), inset -1px -1px 0 var(--hi), inset 2px 2px 0 var(--dark);
+}
+#ask-out.thinking{color:var(--ink-dim); font-style:italic}
+#ask-out.failed{color:#8a0000}
 .toollist{display:flex; flex-direction:column; gap:4px; max-height:190px; overflow:auto; padding-right:2px}
 .tool{display:grid; grid-template-columns:auto 1fr; gap:2px 7px; padding:4px 5px; background:var(--face-lit);
   box-shadow:inset -1px -1px 0 var(--shadow), inset 1px 1px 0 var(--hi)}
@@ -400,6 +407,21 @@ body.touch #touch{display:block}
         <span id="mcp-state" class="pill off">navigator.modelContext: absent</span>
         <button class="btn" id="b-copytools" style="margin-left:auto">Copy tool JSON</button>
       </div>
+      <fieldset id="askwrap" hidden>
+        <legend>Ask Claude to drive</legend>
+        <div class="row" style="gap:6px">
+          <input type="text" id="ask-input" placeholder="Find the exit and tell me how far it was" autocomplete="off" style="flex:1">
+          <button class="btn" id="b-ask">Ask</button>
+          <button class="btn" id="b-stop" hidden>Stop</button>
+        </div>
+        <div class="btns" style="margin-top:7px">
+          <button class="btn" data-ask="Solve this maze and tell me how many steps it took.">Solve it</button>
+          <button class="btn" data-ask="Walk a few corridors from where you are, then describe the layout you found.">Explore</button>
+          <button class="btn" data-ask="Restyle this maze as a moonlit hedge garden, then stand somewhere it looks good.">Restyle it</button>
+        </div>
+        <div id="ask-out" aria-live="polite">Claude drives the maze with the same ten tools, calling them from inside the page. Each answer spends your own Claude usage.</div>
+      </fieldset>
+
       <fieldset>
         <legend>Registered tools</legend>
         <div class="toollist" id="tools"></div>
@@ -1881,7 +1903,7 @@ function registerTools(){
   } else {
     badge.textContent = "navigator.modelContext: not in this browser";
     badge.classList.add("off");
-    logLine("No WebMCP in this browser — window.maze95.call(name, args) still works.");
+    logLine("No navigator.modelContext here (Chrome 146+ only, and never inside a framed viewer). window.maze95.call(name, args) always works.");
   }
 }
 
@@ -1904,6 +1926,114 @@ addEventListener("message", async ev => {
   const res = await api.call(d.tool, d.args);
   (ev.source || window).postMessage({ type:"maze95:result", id:d.id, tool:d.tool, result:res }, "*");
 });
+
+/* ---------------------------------------------------------------------------
+   Two ways an agent reaches this page, because they are different channels:
+
+   1. navigator.modelContext (WebMCP) — a BROWSER API, Chrome 146+. It only
+      exists when the viewer's own browser ships it, and it is absent inside a
+      framed artifact viewer. That is the channel registered above.
+   2. The artifact runtime's `sample` capability — the page hands Claude these
+      same tools and Claude calls back into the page. This is the channel that
+      works on claude.ai, where navigator.modelContext is not available.
+   --------------------------------------------------------------------------- */
+const ASK_RULES = [
+  "You are driving a first-person 3D maze rendered in this web page, using the tools provided.",
+  "Cells are addressed x (column) and z (row), both zero-based, matching the ASCII plan from maze_get_map.",
+  "Work in small steps: read maze_get_state or maze_get_map before moving, and prefer maze_goto or maze_solve over long runs of single moves.",
+  "Pass instant:true to a movement tool only when the viewer asked you to hurry; the walk is worth watching.",
+  "Finish with one or two plain sentences saying what you did and where you ended up. No preamble."
+].join(" ");
+
+const ASK_ERRORS = {
+  not_granted:"Claude access was declined for this page, so the maze can only be driven by hand.",
+  rate_limited:"Claude is handling too many requests right now. Try again in a moment.",
+  tools_unavailable:"This view can't run page tools, so Claude can't drive the maze here.",
+  empty_completion:"Claude didn't answer. Try rewording the request.",
+  cancelled:"Stopped."
+};
+
+function askTools(max){
+  const order = ["maze_get_state","maze_look","maze_get_map","maze_move","maze_turn","maze_goto",
+                 "maze_solve","maze_set_options","maze_new_maze","maze_set_driver"];
+  const picked = order.map(n => TOOLS.find(t => t.name === n)).filter(Boolean).slice(0, max || 10);
+  return picked.map(t => {
+    const tool = {
+      name: t.name,
+      description: t.description,
+      // Claude's tool results come back through the same log the WebMCP calls use,
+      // so the viewer watches the agent work. Throwing hands Claude the message
+      // and lets it carry on, which is what the runtime wants.
+      execute: async (input) => {
+        const a = unwrapArgs(t, input);
+        logLine(t.name + "(" + (Object.keys(a).length ? short(a) : "") + ")");
+        try { const out = await t.run(a); logLine("→ " + short(out)); return out; }
+        catch (err){ const m = (err && err.message) ? err.message : String(err);
+                     logLine("→ error: " + m, "err"); throw new Error(m); }
+      }
+    };
+    const props = t.inputSchema && t.inputSchema.properties;
+    if (props && Object.keys(props).length) tool.inputSchema = t.inputSchema;   // omitted for no-argument tools
+    return tool;
+  });
+}
+
+let askFn = null, askMax = 10, askCtl = null;
+const askOut = () => $("ask-out");
+
+async function initAsk(){
+  if (!(window.claude && typeof window.claude.use === "function")) return;   // not in a Claude viewer
+  const fn = await window.claude.use("sample");                              // null: design for absence
+  if (!fn) return;
+  try {
+    const limits = await fn.limits();
+    if (!limits || !limits.tools){                                           // this view can't run page tools
+      logLine("Claude is reachable here, but this view can't run page tools.");
+      return;
+    }
+    askMax = Math.max(1, limits.tools.maxCount || 10);
+  } catch (e) { /* limits are advisory; the call itself is the real check */ }
+  askFn = fn;
+  $("askwrap").hidden = false;
+  $("mcp-state").textContent = "Claude can drive this page";
+  $("mcp-state").classList.remove("off");
+  logLine("Claude can drive this maze — open Agent tools and ask.");
+  toast("Claude can drive this maze · Agent tools");
+}
+
+async function ask(text){
+  if (!askFn || !text.trim()) return;
+  const out = askOut();
+  askCtl = new AbortController();
+  $("b-ask").disabled = true; $("b-stop").hidden = false;
+  out.className = "thinking"; out.textContent = "Thinking…";
+  try {
+    const { text: answer, truncated } = await askFn(
+      [{ role:"user", content: ASK_RULES + "\n\nThe maze right now:\n" +
+         JSON.stringify(state()) + "\n\nWhat the viewer asked for: " + text.trim() }],
+      { tools: askTools(askMax), signal: askCtl.signal,
+        onText: ({ text:t }) => { out.className = ""; out.textContent = t; } }
+    );
+    out.className = ""; out.textContent = answer + (truncated ? "\n\n(Cut short — ask for less at a time.)" : "");
+  } catch (e){
+    const code = e && e.code;
+    out.className = code === "cancelled" ? "" : "failed";
+    out.textContent = (e && e.text ? e.text + "\n\n" : "") + (ASK_ERRORS[code] || (e && e.message) || "That didn't work.");
+    if (code === "not_granted" || code === "tools_unavailable") $("b-ask").disabled = true;
+  } finally {
+    $("b-stop").hidden = true;
+    if (!$("b-ask").disabled) $("b-ask").disabled = false;
+    askCtl = null;
+  }
+}
+
+$("b-ask").addEventListener("click", () => ask($("ask-input").value));
+$("ask-input").addEventListener("keydown", e => { if (e.key === "Enter"){ e.stopPropagation(); ask($("ask-input").value); } });
+$("b-stop").addEventListener("click", () => askCtl && askCtl.abort());
+document.querySelectorAll("[data-ask]").forEach(b => b.addEventListener("click", () => {
+  $("ask-input").value = b.getAttribute("data-ask");
+  ask(b.getAttribute("data-ask"));
+}));
 
 /* tool list in the agent window */
 $("tools").innerHTML = "";
@@ -1933,6 +2063,7 @@ setInterval(updateReadout, 1000);
 requestAnimationFrame(frame);
 logLine("Maze 95 ready · seed " + M.seed + " · " + M.W + "x" + M.H + " · " + M.longest + " steps start to exit");
 logLine("Standing by — nothing moves until a player or an agent drives it.");
+initAsk();   // resolves later, or never outside a Claude viewer
 })();
 </script>
 
