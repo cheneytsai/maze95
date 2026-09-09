@@ -247,6 +247,13 @@ body.playing #crosshair{opacity:1}
 #log p{margin:0; white-space:pre-wrap; word-break:break-word}
 #log .t{color:#7a7a7a}
 #log .err{color:#ff6b6b}
+#mcp-forms{display:flex; flex-direction:column; gap:7px}
+#mcp-forms form{display:flex; align-items:center; gap:6px; flex-wrap:wrap}
+#mcp-forms label{flex:1 0 74px; font-family:var(--pix); font-size:7.5px; letter-spacing:.06em;
+  text-transform:uppercase; color:var(--ink-dim)}
+#mcp-forms input[type=number]{width:52px}
+#mcp-forms input[type=text]{width:104px}
+.fieldnote{margin:0 0 8px; font-size:10.5px; line-height:1.4; color:var(--ink-dim)}
 .diag{display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:0; align-items:baseline}
 .diag dt{font-family:var(--pix); font-size:7.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-dim)}
 .diag dd{margin:0; font-family:var(--term); font-size:15px; line-height:1.15; color:#202060}
@@ -436,6 +443,28 @@ body.touch #touch{display:block}
           <button class="btn" data-ask="Restyle this maze as a moonlit hedge garden, then stand somewhere it looks good.">Restyle it</button>
         </div>
         <div id="ask-out" aria-live="polite">Claude drives the maze with the same ten tools, calling them from inside the page. Each answer spends your own Claude usage.</div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Declarative tools</legend>
+        <p class="fieldnote">Chrome also reads tools straight off annotated forms, with no JavaScript API involved. These two work by hand as well.</p>
+        <div id="mcp-forms">
+          <form toolname="maze_goto_cell"
+                tooldescription="Walk to a specific cell of the maze. x is the column and z is the row, both zero-based, matching the ASCII plan from maze_get_map."
+                autocomplete="off">
+            <label for="f-x">Go to cell</label>
+            <input type="number" id="f-x" name="x" min="0" value="0" tooldescription="Target column (x), zero-based" required>
+            <input type="number" id="f-z" name="z" min="0" value="0" tooldescription="Target row (z), zero-based" required>
+            <button class="btn" type="submit">Go</button>
+          </form>
+          <form toolname="maze_generate"
+                tooldescription="Generate a fresh maze. Give a seed to reproduce a specific maze, or leave it blank for a random one."
+                autocomplete="off">
+            <label for="f-seed">New maze</label>
+            <input type="text" id="f-seed" name="seed" placeholder="seed (optional)" tooldescription="Seed of the maze to generate; blank for random">
+            <button class="btn" type="submit">Make it</button>
+          </form>
+        </div>
       </fieldset>
 
       <fieldset>
@@ -1902,34 +1931,60 @@ const registered = TOOLS.map(t => ({
   name:t.name, description:t.description, inputSchema:t.inputSchema, execute: wrap(t)
 }));
 
+/* Chrome's own guide documents the imperative API as document.modelContext,
+   while the spec draft and other docs put it on navigator.modelContext. Rather
+   than bet on one, register on every surface that exists. */
+const MC_SURFACES = [
+  ["navigator.modelContext", () => (typeof navigator !== "undefined" ? navigator.modelContext : null)],
+  ["document.modelContext",  () => (typeof document  !== "undefined" ? document.modelContext  : null)],
+  ["window.modelContext",    () => window.modelContext],
+  ["window.agent",           () => window.agent]
+];
+const mcpDone = new Set();
 let mcpCount = 0, mcpVia = null;
 
 /* navigator.modelContext can appear AFTER load — a flag-gated context finishing
    initialisation, or an extension injecting it — so registration is retried for
    a while rather than attempted once at boot and given up on. */
-function tryRegister(announce){
-  const mc = navigator.modelContext;
-  if (!mc) return false;
-  if (mcpCount) return true;
+function registerOn(path, mc){
+  if (!mc || mcpDone.has(path)) return 0;
+  let n = 0, via = null;
   if (typeof mc.registerTool === "function"){
-    let n = 0;
     for (const t of registered){
       try { mc.registerTool(t); n++; }
-      catch(e){ logLine("register " + t.name + " failed: " + e.message, "err"); }
+      catch(e){ logLine(path + ".registerTool(" + t.name + ") failed: " + e.message, "err"); }
     }
-    mcpCount = n; mcpVia = "registerTool";
+    via = "registerTool";
   } else if (typeof mc.provideContext === "function"){
-    mc.provideContext({ tools: registered });
-    mcpCount = registered.length; mcpVia = "provideContext";
-  } else return false;
-  if (announce !== false) logLine("Registered " + mcpCount + " tools via navigator.modelContext." + mcpVia);
-  updateDiagnostics();
-  return true;
+    try { mc.provideContext({ tools: registered }); n = registered.length; via = "provideContext"; }
+    catch(e){ logLine(path + ".provideContext failed: " + e.message, "err"); }
+  } else {
+    logLine(path + " exists but offers neither registerTool nor provideContext.", "err");
+    return 0;
+  }
+  if (n){
+    mcpDone.add(path);
+    mcpCount = Math.max(mcpCount, n);
+    mcpVia = path + "." + via;
+    logLine("Registered " + n + " tools via " + mcpVia);
+  }
+  return n;
+}
+
+function tryRegister(){
+  let any = 0;
+  for (const [path, get] of MC_SURFACES){
+    let mc = null;
+    try { mc = get(); } catch(e){ /* a getter that throws is simply not a surface */ }
+    any += registerOn(path, mc);
+  }
+  if (any) updateDiagnostics();
+  return mcpDone.size > 0;
 }
 
 function registerTools(){
   if (!tryRegister()){
-    logLine("navigator.modelContext is not here yet — watching for it for 20s.");
+    logLine("No modelContext surface yet (checked " + MC_SURFACES.map(s => s[0]).join(", ") + ") — watching for 20s.");
     let tries = 0;
     const timer = setInterval(() => {
       if (tryRegister() || ++tries > 40) clearInterval(timer);
@@ -1943,12 +1998,18 @@ function registerTools(){
 /* The page says out loud why an agent can or cannot see its tools, so this is
    never a guessing game in DevTools. */
 function diagnostics(){
+  const surfaces = {};
+  for (const [path, get] of MC_SURFACES){
+    let mc = null;
+    try { mc = get(); } catch(e){}
+    surfaces[path] = !mc ? "absent"
+      : (typeof mc.registerTool === "function" ? "registerTool"
+        : typeof mc.provideContext === "function" ? "provideContext" : "present, unrecognised API")
+        + (mcpDone.has(path) ? " · registered" : "");
+  }
   return {
-    "navigator.modelContext": !!navigator.modelContext,
-    registrationApi: navigator.modelContext
-      ? (typeof navigator.modelContext.registerTool === "function" ? "registerTool"
-        : typeof navigator.modelContext.provideContext === "function" ? "provideContext" : "unrecognised")
-      : "none",
+    modelContextSurfaces: surfaces,
+    registeredVia: mcpVia || "none",
     toolsRegistered: mcpCount,
     toolsDefined: registered.length,
     secureContext: !!window.isSecureContext,
@@ -1964,7 +2025,8 @@ function updateDiagnostics(){
   const d = diagnostics(), dl = $("diag");
   if (!dl) return;
   const rows = [
-    ["navigator.modelContext", d["navigator.modelContext"] ? "present (" + d.registrationApi + ")" : "absent", d["navigator.modelContext"]],
+    ...Object.entries(d.modelContextSurfaces).map(([k,v]) => [k, v, v !== "absent"]),
+    ["Declarative forms", $("mcp-forms") ? $("mcp-forms").querySelectorAll("form[toolname]").length + " on the page" : "none", true],
     ["Tools registered", d.toolsRegistered + " of " + d.toolsDefined, d.toolsRegistered > 0],
     ["Secure context", d.secureContext ? "yes" : "no — WebMCP needs HTTPS", d.secureContext],
     ["Frame", d.framed ? "framed" : "top level", !d.framed],
@@ -1991,7 +2053,7 @@ function updateDiagnostics(){
   const hint = $("diag-hint");
   if (d.toolsRegistered > 0) hint.textContent = "An agent using WebMCP can see all " + d.toolsRegistered + " tools on this page.";
   else if (d.framed && d.claudeRuntime) hint.innerHTML = "This page is framed by a Claude viewer, where <code>navigator.modelContext</code> is not exposed. Use <strong>Ask Claude to drive</strong> above, or open the GitHub Pages copy directly for WebMCP.";
-  else if (!d["navigator.modelContext"]) hint.innerHTML = "This browser exposes no <code>navigator.modelContext</code>. In Chrome it is an early preview: 146 or newer, with <code>chrome://flags/#enable-webmcp-testing</code> set to Enabled and the browser relaunched, on an HTTPS page. Until then, drive the maze with <code>window.maze95.call(name, args)</code> from this console.";
+  else if (Object.values(d.modelContextSurfaces).every(v => v === "absent")) hint.innerHTML = "This browser exposes no modelContext surface at all — not on <code>navigator</code>, <code>document</code> or <code>window</code>. In Chrome it is an early preview: 146 or newer, with <code>chrome://flags/#enable-webmcp-testing</code> set to Enabled and the browser relaunched, on an HTTPS page. Until then, drive the maze with <code>window.maze95.call(name, args)</code> from this console.";
   else hint.textContent = "navigator.modelContext is present but no tool registered — see the log above.";
 }
 
@@ -2007,7 +2069,7 @@ const api = {
   },
   getState: () => state(),
   diagnostics: () => diagnostics(),
-  register: () => { mcpCount = 0; return tryRegister(); }
+  register: () => { mcpDone.clear(); mcpCount = 0; return tryRegister(); }
 };
 window.maze95 = api;
 addEventListener("message", async ev => {
@@ -2124,6 +2186,16 @@ document.querySelectorAll("[data-ask]").forEach(b => b.addEventListener("click",
   ask(b.getAttribute("data-ask"));
 }));
 
+/* The declarative forms are genuine controls, not markup for the crawler: an
+   agent submits them, and so can a person. */
+$("mcp-forms").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const form = ev.target, tool = form.getAttribute("toolname");
+  const data = Object.fromEntries(new FormData(form).entries());
+  if (tool === "maze_goto_cell") await api.call("maze_goto", { x:Number(data.x), z:Number(data.z) });
+  else if (tool === "maze_generate") await api.call("maze_new_maze", data.seed ? { seed:String(data.seed) } : {});
+});
+
 /* tool list in the agent window */
 $("tools").innerHTML = "";
 for (const t of TOOLS){
@@ -2136,9 +2208,9 @@ for (const t of TOOLS){
   el.append(code, desc); $("tools").appendChild(el);
 }
 $("b-reregister").addEventListener("click", () => {
-  mcpCount = 0;
-  if (tryRegister()) toast("Registered " + mcpCount + " tools with navigator.modelContext");
-  else { updateDiagnostics(); toast("navigator.modelContext still isn't available in this browser"); }
+  mcpDone.clear(); mcpCount = 0;
+  if (tryRegister()) toast("Registered " + mcpCount + " tools via " + mcpVia);
+  else { updateDiagnostics(); toast("No modelContext surface in this browser yet"); }
 });
 $("b-copydiag").addEventListener("click", async () => {
   const json = JSON.stringify(diagnostics(), null, 2);
