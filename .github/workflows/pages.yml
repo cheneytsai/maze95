@@ -1,4 +1,7 @@
-name: Deploy to GitHub Pages
+name: Publish to gh-pages
+
+# Pages serves this repo from the gh-pages branch, so a push to main copies
+# the site across. Editing index.html on main is all it takes to ship.
 
 on:
   push:
@@ -6,30 +9,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: gh-pages
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  publish:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
         with:
-          enablement: true
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: .
-      - name: Deploy
-        id: deploy
-        uses: actions/deploy-pages@v4
+          fetch-depth: 0
+
+      - name: Copy the site onto gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+          git checkout main -- index.html README.md LICENSE
+          touch .nojekyll
+          git add -A
+          git diff --cached --quiet && echo "Nothing to publish" && exit 0
+          git commit -m "Publish ${GITHUB_SHA::7}"
+          git push origin gh-pages
