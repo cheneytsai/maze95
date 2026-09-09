@@ -59,27 +59,34 @@ deliberately does not, so every load is a new maze. `?seed=ABC123` reproduces on
 The same ten tools are offered over three channels, because they are genuinely
 different things and only one of them works in any given place:
 
-1. **`navigator.modelContext`** (WebMCP) — a *browser* API, and still an early preview.
-   In Chrome it needs 146 or newer with `chrome://flags/#enable-webmcp-testing` set to
-   Enabled, the browser relaunched, and an HTTPS page; it is never exposed inside a framed
-   viewer. Tools are registered with `registerTool()`, falling back to `provideContext()`
-   on older drafts. Registration is retried for 20 seconds and on window focus, so an API
-   that appears after load — a flag-gated context finishing initialisation, an extension
-   injecting it — still gets the tools.
-2. **The Claude artifact runtime.** Published as an artifact, the page declares the
+1. **WebMCP, imperatively.** Chrome's guide documents the imperative API as
+   `document.modelContext.registerTool()`, while the spec draft and other docs put it on
+   `navigator.modelContext`. So the page registers on **every surface it finds** —
+   `navigator.modelContext`, `document.modelContext`, `window.modelContext` and
+   `window.agent` — using `registerTool()` where it exists and `provideContext()` where it
+   doesn't. Registration is retried every 500ms for 20 seconds and on focus, so a surface
+   that appears after load still gets the tools. In Chrome this needs 146+ with
+   `chrome://flags/#enable-webmcp-testing` enabled on an HTTPS page, and it is never
+   exposed inside a framed viewer.
+2. **WebMCP, declaratively.** Two annotated `<form toolname=... tooldescription=...>`
+   controls in the Agent tools window — go to a cell, and generate a maze from a seed.
+   Chrome reads these off the markup with no JavaScript API involved, so they work even
+   where the imperative surface is named differently than expected. They are real controls:
+   a person can submit them too.
+3. **The Claude artifact runtime.** Published as an artifact, the page declares the
    `sample` capability and hands Claude these same tools through `claude.use("sample")`.
    **Ask Claude to drive** in the Agent tools window is that channel: type an instruction,
    and Claude calls the tools from inside the page while you watch the log. This is what
    works on claude.ai, where `navigator.modelContext` does not exist.
-3. **`window.maze95`** — always present. `window.maze95.call(name, args)` from a console,
+4. **`window.maze95`** — always present. `window.maze95.call(name, args)` from a console,
    an extension or a driver script, or post `{type:"maze95:call", tool, args}` to the frame
    and read the `maze95:result` reply.
 
 Every call, whichever channel it came from, is echoed in the on-screen log.
 
-**If an agent can't see the tools**, the Agent tools window answers why: whether
-`navigator.modelContext` is present and which registration API it offers, how many tools
-registered, whether the page is in a secure context, whether it is framed, and whether the
+**If an agent can't see the tools**, the Agent tools window answers why: it lists every
+modelContext surface and what each one offers, how many tools registered and through
+which surface, how many declarative forms are on the page, whether the page is in a secure context, whether it is framed, and whether the
 Claude runtime is there. `window.maze95.diagnostics()` returns the same as JSON, and the
 page logs it to the console on load. `window.maze95.register()` retries registration by
 hand.
