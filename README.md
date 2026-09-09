@@ -4,7 +4,11 @@ A full-screen web recreation of the Windows 95 **3D Maze** screensaver — playa
 customizable, freshly generated on every load, and drivable by a browser agent
 through [WebMCP](https://github.com/webmachinelearning/webmcp).
 
-Open `index.html`. That's the whole project: one file, no build step, no dependencies.
+**Play it: https://cheneytsai.github.io/maze95/**
+
+Or open `index.html` locally. That's the whole project: one file, no build step, no
+dependencies. GitHub Pages serves the `gh-pages` branch; pushing to `main` copies the
+site across.
 
 ## Why it isn't a port
 
