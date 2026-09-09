@@ -56,10 +56,22 @@ deliberately does not, so every load is a new maze. `?seed=ABC123` reproduces on
 
 ## Agent tools
 
-Registered with `navigator.modelContext.registerTool()` where the browser has it
-(Chrome 146+), falling back to `provideContext()`. Agents without WebMCP can call
-`window.maze95.call(name, args)` or post `{type:"maze95:call", tool, args}` to the frame.
-Every call is echoed in the on-screen log.
+The same ten tools are offered over three channels, because they are genuinely
+different things and only one of them works in any given place:
+
+1. **`navigator.modelContext`** (WebMCP) — a *browser* API, Chrome 146+. It exists only
+   when the viewer's own browser ships it, and never inside a framed viewer. Tools are
+   registered with `registerTool()`, falling back to `provideContext()` on older drafts.
+2. **The Claude artifact runtime.** Published as an artifact, the page declares the
+   `sample` capability and hands Claude these same tools through `claude.use("sample")`.
+   **Ask Claude to drive** in the Agent tools window is that channel: type an instruction,
+   and Claude calls the tools from inside the page while you watch the log. This is what
+   works on claude.ai, where `navigator.modelContext` does not exist.
+3. **`window.maze95`** — always present. `window.maze95.call(name, args)` from a console,
+   an extension or a driver script, or post `{type:"maze95:call", tool, args}` to the frame
+   and read the `maze95:result` reply.
+
+Every call, whichever channel it came from, is echoed in the on-screen log.
 
 | Tool | Does |
 | --- | --- |
