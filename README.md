@@ -59,9 +59,13 @@ deliberately does not, so every load is a new maze. `?seed=ABC123` reproduces on
 The same ten tools are offered over three channels, because they are genuinely
 different things and only one of them works in any given place:
 
-1. **`navigator.modelContext`** (WebMCP) — a *browser* API, Chrome 146+. It exists only
-   when the viewer's own browser ships it, and never inside a framed viewer. Tools are
-   registered with `registerTool()`, falling back to `provideContext()` on older drafts.
+1. **`navigator.modelContext`** (WebMCP) — a *browser* API, and still an early preview.
+   In Chrome it needs 146 or newer with `chrome://flags/#enable-webmcp-testing` set to
+   Enabled, the browser relaunched, and an HTTPS page; it is never exposed inside a framed
+   viewer. Tools are registered with `registerTool()`, falling back to `provideContext()`
+   on older drafts. Registration is retried for 20 seconds and on window focus, so an API
+   that appears after load — a flag-gated context finishing initialisation, an extension
+   injecting it — still gets the tools.
 2. **The Claude artifact runtime.** Published as an artifact, the page declares the
    `sample` capability and hands Claude these same tools through `claude.use("sample")`.
    **Ask Claude to drive** in the Agent tools window is that channel: type an instruction,
@@ -72,6 +76,13 @@ different things and only one of them works in any given place:
    and read the `maze95:result` reply.
 
 Every call, whichever channel it came from, is echoed in the on-screen log.
+
+**If an agent can't see the tools**, the Agent tools window answers why: whether
+`navigator.modelContext` is present and which registration API it offers, how many tools
+registered, whether the page is in a secure context, whether it is framed, and whether the
+Claude runtime is there. `window.maze95.diagnostics()` returns the same as JSON, and the
+page logs it to the console on load. `window.maze95.register()` retries registration by
+hand.
 
 | Tool | Does |
 | --- | --- |
