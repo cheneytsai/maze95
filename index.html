@@ -376,7 +376,7 @@ body.touch #touch{display:block}
         <legend>Movement</legend>
         <div class="row"><label for="s-speed">Walk speed</label><span class="val" id="v-speed">14</span><input type="range" id="s-speed" min="4" max="40" step="1" value="14"></div>
         <div class="row"><label for="s-sens">Mouse look</label><span class="val" id="v-sens">10</span><input type="range" id="s-sens" min="2" max="30" step="1" value="10"></div>
-        <div class="row"><label for="s-idle">Screensaver resumes after</label><span class="val" id="v-idle">12</span><input type="range" id="s-idle" min="0" max="60" step="2" value="12"></div>
+        <div class="row"><label for="s-idle">Idle starts screensaver after (0 = never)</label><span class="val" id="v-idle">0</span><input type="range" id="s-idle" min="0" max="60" step="2" value="0"></div>
       </fieldset>
 
       <fieldset>
@@ -414,7 +414,7 @@ body.touch #touch{display:block}
 
 <div id="touch"><div id="stick"><div id="nub"></div></div></div>
 
-<div id="hint"><kbd>Click</kbd> to take control &nbsp;&middot;&nbsp; <kbd>W A S D</kbd> move &nbsp;&middot;&nbsp; <kbd>Tab</kbd> map &nbsp;&middot;&nbsp; <kbd>Esc</kbd> hand it back</div>
+<div id="hint"><kbd>Click</kbd> to play &nbsp;&middot;&nbsp; <kbd>W A S D</kbd> move &nbsp;&middot;&nbsp; <kbd>Tab</kbd> map &nbsp;&middot;&nbsp; <kbd>Esc</kbd> stop &nbsp;&middot;&nbsp; <kbd>Screensaver</kbd> to watch it walk itself</div>
 <div id="toast" role="status"></div>
 
 <div id="bar">
@@ -1021,14 +1021,14 @@ const SHAPES = (() => {
 })();
 
 /* =========================  STATE  ======================================= */
-const SETTINGS_VERSION = 2;
+const SETTINGS_VERSION = 3;
 const DEFAULTS = {
   v:SETTINGS_VERSION,
   size:14, braid:0, theme:"brick", floorStyle:"classic", ceilStyle:"classic",
   decor:true, exitOn:true, drift:false, regen:true,
   fog:90, fov:75, wallHeight:10, res:100, lighting:"classic",
   scan:false, bob:false, reveal:false, mini:true,
-  speed:14, sens:10, idle:12
+  speed:14, sens:10, idle:0
 };
 /* everything the 1995 screensaver was: perfect maze, no exit, no goal, no stopping */
 const CLASSIC = { theme:"brick", floorStyle:"classic", ceilStyle:"classic", lighting:"classic",
@@ -1043,7 +1043,7 @@ const saveOpts = () => { try { localStorage.setItem("maze95.settings", JSON.stri
 
 let M, scene, portal, drifters = [], visited, theme, tex;
 let cam = { x:0, y:EYE, z:0, yaw:0, pitch:0, bob:0 };
-let mode = "auto";                 // auto | human | agent
+let mode = "ready";                // ready | human | agent | auto (the screensaver)
 let solved = false, startedAt = 0, elapsedFrozen = 0;
 let lastInput = 0, agentBusy = null;
 const keys = new Set();
@@ -1178,11 +1178,24 @@ function shortAngle(a,b){ let d = (b-a) % TAU; if (d > Math.PI) d -= TAU; if (d 
 
 /* ---------- agent navigation: walk a list of cells, resolve when done ----- */
 let nav = null;
-function walkCells(cells, speedMul){
+/* A tool call resolves when the walk finishes, so the walk must never make an
+   agent wait: long routes animate proportionally faster, and `instant` skips
+   the animation altogether. */
+function walkCells(cells, instant){
   return new Promise(resolve => {
     if (!cells || cells.length < 2){ resolve({steps:0}); return; }
-    nav = { cells, i:0, t:0, speed:(speedMul||2.2), resolve, steps:0 };
     mode = "agent"; syncMode();
+    const n = cells.length - 1;
+    if (instant){
+      for (const c of cells) visited[M.idx(c[0],c[1])] = 1;
+      const last = cells[n], prev = cells[n-1];
+      cam.x = (last[0]+0.5)*CELL; cam.z = (last[1]+0.5)*CELL;
+      cam.yaw = Math.atan2(-(last[0]-prev[0]), -(last[1]-prev[1]));
+      mapDirty = true;
+      if (!solved && last[0]===M.exit[0] && last[1]===M.exit[1]) onSolved();
+      resolve({steps:n}); return;
+    }
+    nav = { cells, i:0, t:0, speed: clamp(n/3.5, 2.4, 30), resolve, steps:0 };  // ~3.5s, whatever the distance
   });
 }
 function navUpdate(dt){
@@ -1190,7 +1203,7 @@ function navUpdate(dt){
   const ax=(a[0]+0.5)*CELL, az=(a[1]+0.5)*CELL, bx=(b[0]+0.5)*CELL, bz=(b[1]+0.5)*CELL;
   const want = Math.atan2(-(bx-ax), -(bz-az));      // yaw whose forward is (-sin, -cos)
   cam.yaw += shortAngle(cam.yaw, want) * Math.min(1, dt*10);
-  nav.t += dt * nav.speed * (opt.speed/14);
+  nav.t += dt * nav.speed;                          // agent pace is its own, not the walk-speed slider
   const t = Math.min(1, nav.t);
   cam.x = lerp(ax,bx,t); cam.z = lerp(az,bz,t);
   if (t >= 1){
@@ -1208,8 +1221,11 @@ function stopNav(reason){
 
 function onSolved(){
   solved = true; elapsedFrozen = performance.now() - startedAt;
-  toast("Exit reached · " + fmtTime(elapsedFrozen) + (opt.regen ? " · new maze coming up" : ""));
-  if (opt.regen) setTimeout(() => { if (solved) newMaze(null); }, 2200);
+  // never regenerate under an agent: the world must not change between its tool
+  // calls. It asks for a new maze when it wants one.
+  const regen = opt.regen && mode !== "agent";
+  toast("Exit reached · " + fmtTime(elapsedFrozen) + (regen ? " · new maze coming up" : ""));
+  if (regen) setTimeout(() => { if (solved && mode !== "agent") newMaze(null); }, 2200);
 }
 
 /* =========================  MINIMAP  ===================================== */
@@ -1275,10 +1291,11 @@ function frame(now){
   // --- update -------------------------------------------------------------
   if (nav) navUpdate(dt);
   else if (mode === "auto") autoUpdate(dt);
-  else humanUpdate(dt);
+  else humanUpdate(dt);                          // "ready" is this, with no keys down
 
-  if (mode !== "auto" && !nav && opt.idle > 0 && (now - lastInput)/1000 > opt.idle){
-    setMode("auto"); toast("Screensaver resumed");
+  // the screensaver only ever starts on request, and never interrupts an agent
+  if (mode === "human" && !nav && opt.idle > 0 && (now - lastInput)/1000 > opt.idle){
+    setMode("auto"); toast("Screensaver started");
   }
 
   const moving = (mode==="auto" && auto.moving>0) || nav || (mode==="human" && movingNow);
@@ -1392,17 +1409,18 @@ function setMode(m){
   }
   mode = m; syncMode();
 }
+const MODE_LABEL = { ready:"waiting", human:"player", agent:"agent", auto:"screensaver" };
 function syncMode(){
-  document.getElementById("r-mode").textContent = mode === "auto" ? "screensaver" : mode;
+  document.getElementById("r-mode").textContent = MODE_LABEL[mode] || mode;
   document.getElementById("b-auto").setAttribute("aria-pressed", String(mode === "auto"));
   document.body.classList.toggle("playing", mode === "human");
-  document.getElementById("hint").hidden = mode !== "auto";
+  document.getElementById("hint").hidden = (mode === "human" || mode === "agent");
 }
 
 /* =========================  INPUT  ======================================= */
 addEventListener("keydown", e => {
   const k = e.key.toLowerCase();
-  if (k === "escape"){ setMode("auto"); return; }
+  if (k === "escape"){ stopNav("stopped"); setMode("ready"); return; }
   if (["w","a","s","d","q","e","arrowup","arrowdown","arrowleft","arrowright","shift"].includes(k)){
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
     e.preventDefault();
@@ -1515,7 +1533,7 @@ $("b-full").addEventListener("click", () => {
 $("b-regen").addEventListener("click", () => { newMaze(null); toast("New maze · seed " + M.seed); });
 $("b-regen2").addEventListener("click", () => { newMaze(null); toast("New maze · seed " + M.seed); });
 $("b-replay").addEventListener("click", () => { newMaze(M.seed); toast("Back to the start of " + M.seed); });
-$("b-auto").addEventListener("click", () => { stopNav("mode changed"); setMode(mode === "auto" ? "human" : "auto"); });
+$("b-auto").addEventListener("click", () => { stopNav("mode changed"); setMode(mode === "auto" ? "ready" : "auto"); });
 $("b-classic").addEventListener("click", () => {
   Object.assign(opt, CLASSIC); saveOpts(); syncControls(); restyle(); applyAll();
   toast("Classic 95 · brick, grey, no exit, no end");
@@ -1583,8 +1601,11 @@ function state(extra){
     start:{x:M.start[0], z:M.start[1]}, exit:{x:M.exit[0], z:M.exit[1]},
     openings, canMove:rel,
     stepsToExit: path ? path.length-1 : null,
-    solved, driver:mode, elapsedSeconds:+(((solved?elapsedFrozen:performance.now()-startedAt)/1000).toFixed(1)),
-    visitedCells: visited.reduce((a,b)=>a+b, 0)
+    solved, driver:MODE_LABEL[mode] || mode, elapsedSeconds:+(((solved?elapsedFrozen:performance.now()-startedAt)/1000).toFixed(1)),
+    visitedCells: visited.reduce((a,b)=>a+b, 0),
+    options:{ theme:opt.theme, floor:opt.floorStyle, ceiling:opt.ceilStyle, lighting:opt.lighting,
+              fog:opt.fog, fov:opt.fov, wallHeight:opt.wallHeight, speed:opt.speed, braid:opt.braid,
+              decor:opt.decor, drift:opt.drift, exitPortal:opt.exitOn, revealMap:opt.reveal }
   }, extra || {});
 }
 /* an ASCII plan of the maze — an agent can read this far faster than pixels */
@@ -1649,7 +1670,8 @@ const TOOLS = [
     description:"Walk whole cells relative to the current heading. Stops early at a wall and reports how far it got.",
     inputSchema:{ type:"object", properties:{
         direction:{type:"string", enum:["forward","back","left","right"], description:"Direction relative to the current heading"},
-        cells:{type:"integer", minimum:1, maximum:64, description:"How many cells to walk (default 1)"}
+        cells:{type:"integer", minimum:1, maximum:64, description:"How many cells to walk (default 1)"},
+        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
       }, required:["direction"], additionalProperties:false },
     run: async a => {
       const f = facing();
@@ -1663,7 +1685,7 @@ const TOOLS = [
         if (M.wall(x,z,d)){ stoppedBy = "wall"; break; }
         x += DIRS[d][0]; z += DIRS[d][1]; cells.push([x,z]); moved++;
       }
-      if (moved) await walkCells(cells);
+      if (moved) await walkCells(cells, !!a.instant);
       return state({ requested:want, moved, stoppedBy, movedDirection:DIRNAME[d] });
     } },
 
@@ -1692,25 +1714,28 @@ const TOOLS = [
     description:"Walk the shortest route to a given cell, turning corners on the way. Coordinates are zero-based, x across and z down, matching maze_get_map.",
     inputSchema:{ type:"object", properties:{
         x:{type:"integer", minimum:0, description:"Target column"},
-        z:{type:"integer", minimum:0, description:"Target row"}
+        z:{type:"integer", minimum:0, description:"Target row"},
+        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
       }, required:["x","z"], additionalProperties:false },
     run: async a => {
       const x = clamp(a.x|0, 0, M.W-1), z = clamp(a.z|0, 0, M.H-1);
       const path = findPath(M, cellOf(cam.x,cam.z), [x,z]);
       if (!path) throw new Error(`No route to ${x},${z} — that cell is walled off.`);
       stopNav("new route");
-      const r = await walkCells(path);
+      const r = await walkCells(path, !!a.instant);
       return state({ routeLength:path.length-1, stepsWalked:r.steps, arrived:!r.interrupted });
     } },
 
   { name:"maze_solve",
     description:"Walk the shortest route from where the player is standing to the exit portal.",
-    inputSchema:{ type:"object", properties:{}, additionalProperties:false },
-    run: async () => {
+    inputSchema:{ type:"object", properties:{
+        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
+      }, additionalProperties:false },
+    run: async a => {
       const path = findPath(M, cellOf(cam.x,cam.z), M.exit);
       if (!path) throw new Error("No route to the exit from here.");
       stopNav("solving");
-      const r = await walkCells(path, 3.0);
+      const r = await walkCells(path, !!(a && a.instant));
       return state({ routeLength:path.length-1, stepsWalked:r.steps, reachedExit:solved });
     } },
 
@@ -1764,13 +1789,14 @@ const TOOLS = [
     } },
 
   { name:"maze_set_driver",
-    description:"Choose who is walking: 'screensaver' for the automatic wall-following demo, 'agent' to hold position for tool-driven moves, 'player' to hand control back to the keyboard.",
+    description:"Choose who is walking. The maze never moves on its own: it waits until a driver is set or a movement tool is called.",
     inputSchema:{ type:"object", properties:{
-        driver:{type:"string", enum:["screensaver","agent","player"], description:"Who drives the camera"}
+        driver:{type:"string", enum:["stop","screensaver","agent","player"], description:"stop leaves the camera still and waiting, screensaver runs the automatic wall follower, agent holds it for tool-driven moves, player hands control to the keyboard"}
       }, required:["driver"], additionalProperties:false },
     run: a => {
       stopNav("driver changed");
-      setMode(a.driver === "screensaver" ? "auto" : a.driver === "player" ? "human" : "agent");
+      setMode(a.driver === "screensaver" ? "auto" : a.driver === "player" ? "human"
+            : a.driver === "stop" ? "ready" : "agent");
       return state();
     } }
 ];
@@ -1804,9 +1830,23 @@ function logLine(text, cls){
 }
 const short = v => { const s = JSON.stringify(v); return s && s.length > 90 ? s.slice(0,90)+"…" : s; };
 
+/* WebMCP hosts differ over whether a handler is called with the arguments
+   themselves or with a wrapper carrying them, and some pass JSON text. Normalise
+   all three so a tool call behaves the same in every browser. */
+function unwrapArgs(tool, raw){
+  let a = raw;
+  if (typeof a === "string"){ try { a = JSON.parse(a); } catch(e){ a = {}; } }
+  if (!a || typeof a !== "object") return {};
+  const declared = tool.inputSchema.properties || {};
+  for (const key of ["arguments","args","input","params","parameters"]){
+    if (!(key in declared) && a[key] && typeof a[key] === "object" && !Array.isArray(a[key])) return a[key];
+  }
+  return a;
+}
+
 function wrap(tool){
-  return async (args) => {
-    const a = args || {};
+  return async (raw) => {
+    const a = unwrapArgs(tool, raw);
     logLine(tool.name + "(" + (Object.keys(a).length ? short(a) : "") + ")");
     try {
       const out = await tool.run(a);
@@ -1886,12 +1926,13 @@ $("b-copytools").addEventListener("click", async () => {
 syncControls();
 newMaze(new URLSearchParams(location.search).get("seed"));   // a fresh maze on every load
 applyAll();
-setMode("auto");
+setMode("ready");
 registerTools();
 updateReadout();
 setInterval(updateReadout, 1000);
 requestAnimationFrame(frame);
 logLine("Maze 95 ready · seed " + M.seed + " · " + M.W + "x" + M.H + " · " + M.longest + " steps start to exit");
+logLine("Standing by — nothing moves until a player or an agent drives it.");
 })();
 </script>
 

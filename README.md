@@ -35,10 +35,11 @@ dead ends knocked through) so corridors form loops. Start and exit are the two f
 apart cells, found with two breadth-first sweeps.
 
 **Four ways to move**
-- *Screensaver* — the left-hand wall follower, turning and gliding cell to cell like the 1995 original.
+- *Nobody, until asked* — the maze opens standing still. It never walks on its own, so an agent's first tool call starts from a known state.
+- *Screensaver* — the left-hand wall follower, turning and gliding cell to cell like the 1995 original. Press the taskbar button to start it; it never starts itself.
 - *Player* — `W A S D` / arrows, `Shift` to run, mouse look under pointer lock, `Esc` to hand it back. Touch gets a thumbstick and drag-to-look.
 - *Agent* — tool calls walk the camera along a path and resolve when the walk finishes.
-- Idle for the configured number of seconds and the screensaver takes over again, exactly like the real thing.
+- Set an idle timeout and the screensaver takes over after a player stops moving, exactly like the real thing. It defaults to off, and it never interrupts an agent.
 
 **Faithful by default** — it opens the way the 1995 screensaver looked: red brick with
 grey mortar, mottled grey stone above and below, a perfect maze with no loops, and the
@@ -75,6 +76,17 @@ Every call is echoed in the on-screen log.
 
 Because `maze_look` and `maze_get_map` return the layout as text, an agent can solve the
 maze without ever looking at a pixel.
+
+Four things make agent control predictable:
+
+- **Nothing moves unless asked.** No autoplay, and the screensaver never starts on its own,
+  so state between two tool calls only changes if a tool changed it.
+- **Movement tools resolve when the walk lands.** Long routes animate proportionally faster
+  so a call never takes more than a few seconds, and `instant: true` skips the animation.
+- **The maze never regenerates under an agent**, even with "New maze at exit" on. It reports
+  `solved: true` and waits for `maze_new_maze`.
+- **Arguments are normalised.** Whether the host passes the arguments directly, wraps them
+  in `arguments`/`input`/`params`, or hands over JSON text, the tool sees the same object.
 
 ## Keys
 
