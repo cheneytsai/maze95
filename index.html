@@ -247,6 +247,13 @@ body.playing #crosshair{opacity:1}
 #log p{margin:0; white-space:pre-wrap; word-break:break-word}
 #log .t{color:#7a7a7a}
 #log .err{color:#ff6b6b}
+.diag{display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:0; align-items:baseline}
+.diag dt{font-family:var(--pix); font-size:7.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-dim)}
+.diag dd{margin:0; font-family:var(--term); font-size:15px; line-height:1.15; color:#202060}
+.diag dd.no{color:#8a0000}
+.diag dd.yes{color:#006000}
+#diag-hint{margin:7px 0 0; font-size:10.5px; line-height:1.45; color:var(--ink-dim)}
+#diag-hint code{font-family:var(--term); font-size:13px; color:#000060; word-break:break-all}
 #ask-out{
   margin-top:8px; padding:6px 7px; min-height:52px; max-height:190px; overflow:auto;
   background:var(--field); color:var(--ink); font-size:11px; line-height:1.45; white-space:pre-wrap;
@@ -405,8 +412,17 @@ body.touch #touch{display:block}
     <div class="body">
       <div class="row" style="gap:6px">
         <span id="mcp-state" class="pill off">navigator.modelContext: absent</span>
-        <button class="btn" id="b-copytools" style="margin-left:auto">Copy tool JSON</button>
       </div>
+      <fieldset>
+        <legend>Why an agent can or can't see the tools</legend>
+        <dl class="diag" id="diag"></dl>
+        <p id="diag-hint"></p>
+        <div class="btns" style="margin-top:7px">
+          <button class="btn" id="b-reregister">Re-register</button>
+          <button class="btn" id="b-copytools">Copy tool JSON</button>
+          <button class="btn" id="b-copydiag">Copy diagnostics</button>
+        </div>
+      </fieldset>
       <fieldset id="askwrap" hidden>
         <legend>Ask Claude to drive</legend>
         <div class="row" style="gap:6px">
@@ -1886,25 +1902,97 @@ const registered = TOOLS.map(t => ({
   name:t.name, description:t.description, inputSchema:t.inputSchema, execute: wrap(t)
 }));
 
-function registerTools(){
+let mcpCount = 0, mcpVia = null;
+
+/* navigator.modelContext can appear AFTER load — a flag-gated context finishing
+   initialisation, or an extension injecting it — so registration is retried for
+   a while rather than attempted once at boot and given up on. */
+function tryRegister(announce){
   const mc = navigator.modelContext;
-  const badge = $("mcp-state");
-  if (mc && typeof mc.registerTool === "function"){
+  if (!mc) return false;
+  if (mcpCount) return true;
+  if (typeof mc.registerTool === "function"){
     let n = 0;
-    for (const t of registered){ try { mc.registerTool(t); n++; } catch(e){ logLine("register " + t.name + " failed: " + e.message, "err"); } }
-    badge.textContent = "navigator.modelContext: " + n + " tools live";
-    badge.classList.remove("off");
-    logLine("Registered " + n + " tools with navigator.modelContext.registerTool");
-  } else if (mc && typeof mc.provideContext === "function"){
+    for (const t of registered){
+      try { mc.registerTool(t); n++; }
+      catch(e){ logLine("register " + t.name + " failed: " + e.message, "err"); }
+    }
+    mcpCount = n; mcpVia = "registerTool";
+  } else if (typeof mc.provideContext === "function"){
     mc.provideContext({ tools: registered });
-    badge.textContent = "navigator.modelContext: " + registered.length + " tools live";
+    mcpCount = registered.length; mcpVia = "provideContext";
+  } else return false;
+  if (announce !== false) logLine("Registered " + mcpCount + " tools via navigator.modelContext." + mcpVia);
+  updateDiagnostics();
+  return true;
+}
+
+function registerTools(){
+  if (!tryRegister()){
+    logLine("navigator.modelContext is not here yet — watching for it for 20s.");
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (tryRegister() || ++tries > 40) clearInterval(timer);
+    }, 500);
+    addEventListener("focus", () => tryRegister());
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) tryRegister(); });
+  }
+  updateDiagnostics();
+}
+
+/* The page says out loud why an agent can or cannot see its tools, so this is
+   never a guessing game in DevTools. */
+function diagnostics(){
+  return {
+    "navigator.modelContext": !!navigator.modelContext,
+    registrationApi: navigator.modelContext
+      ? (typeof navigator.modelContext.registerTool === "function" ? "registerTool"
+        : typeof navigator.modelContext.provideContext === "function" ? "provideContext" : "unrecognised")
+      : "none",
+    toolsRegistered: mcpCount,
+    toolsDefined: registered.length,
+    secureContext: !!window.isSecureContext,
+    framed: window.top !== window.self,
+    claudeRuntime: !!(window.claude && typeof window.claude.use === "function"),
+    claudeCanDrive: !!askFn,
+    windowMaze95: typeof window.maze95 === "object",
+    url: location.origin + location.pathname,
+    userAgent: navigator.userAgent
+  };
+}
+function updateDiagnostics(){
+  const d = diagnostics(), dl = $("diag");
+  if (!dl) return;
+  const rows = [
+    ["navigator.modelContext", d["navigator.modelContext"] ? "present (" + d.registrationApi + ")" : "absent", d["navigator.modelContext"]],
+    ["Tools registered", d.toolsRegistered + " of " + d.toolsDefined, d.toolsRegistered > 0],
+    ["Secure context", d.secureContext ? "yes" : "no — WebMCP needs HTTPS", d.secureContext],
+    ["Frame", d.framed ? "framed" : "top level", !d.framed],
+    ["Claude runtime", d.claudeCanDrive ? "can drive this page" : d.claudeRuntime ? "present" : "absent", d.claudeCanDrive],
+    ["window.maze95", d.windowMaze95 ? d.toolsDefined + " tools, always callable" : "missing", d.windowMaze95]
+  ];
+  dl.innerHTML = "";
+  for (const [k,v,ok] of rows){
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v; dd.className = ok ? "yes" : "no";
+    dl.append(dt, dd);
+  }
+  const badge = $("mcp-state");
+  if (d.toolsRegistered > 0){
+    badge.textContent = "navigator.modelContext: " + d.toolsRegistered + " tools live";
     badge.classList.remove("off");
-    logLine("Registered " + registered.length + " tools via provideContext");
+  } else if (d.claudeCanDrive){
+    badge.textContent = "Claude can drive this page";
+    badge.classList.remove("off");
   } else {
     badge.textContent = "navigator.modelContext: not in this browser";
     badge.classList.add("off");
-    logLine("No navigator.modelContext here (Chrome 146+ only, and never inside a framed viewer). window.maze95.call(name, args) always works.");
   }
+  const hint = $("diag-hint");
+  if (d.toolsRegistered > 0) hint.textContent = "An agent using WebMCP can see all " + d.toolsRegistered + " tools on this page.";
+  else if (d.framed && d.claudeRuntime) hint.innerHTML = "This page is framed by a Claude viewer, where <code>navigator.modelContext</code> is not exposed. Use <strong>Ask Claude to drive</strong> above, or open the GitHub Pages copy directly for WebMCP.";
+  else if (!d["navigator.modelContext"]) hint.innerHTML = "This browser exposes no <code>navigator.modelContext</code>. In Chrome it is an early preview: 146 or newer, with <code>chrome://flags/#enable-webmcp-testing</code> set to Enabled and the browser relaunched, on an HTTPS page. Until then, drive the maze with <code>window.maze95.call(name, args)</code> from this console.";
+  else hint.textContent = "navigator.modelContext is present but no tool registered — see the log above.";
 }
 
 /* Fallback surface for agents without WebMCP: drive the page from the console,
@@ -1917,7 +2005,9 @@ const api = {
     if (!t) return Promise.resolve({ content:[{type:"text", text:"Error: no tool named " + name}], isError:true });
     return t.execute(args || {});
   },
-  getState: () => state()
+  getState: () => state(),
+  diagnostics: () => diagnostics(),
+  register: () => { mcpCount = 0; return tryRegister(); }
 };
 window.maze95 = api;
 addEventListener("message", async ev => {
@@ -1995,8 +2085,7 @@ async function initAsk(){
   } catch (e) { /* limits are advisory; the call itself is the real check */ }
   askFn = fn;
   $("askwrap").hidden = false;
-  $("mcp-state").textContent = "Claude can drive this page";
-  $("mcp-state").classList.remove("off");
+  updateDiagnostics();
   logLine("Claude can drive this maze — open Agent tools and ask.");
   toast("Claude can drive this maze · Agent tools");
 }
@@ -2046,6 +2135,16 @@ for (const t of TOOLS){
   const desc = document.createElement("span"); desc.textContent = t.description;
   el.append(code, desc); $("tools").appendChild(el);
 }
+$("b-reregister").addEventListener("click", () => {
+  mcpCount = 0;
+  if (tryRegister()) toast("Registered " + mcpCount + " tools with navigator.modelContext");
+  else { updateDiagnostics(); toast("navigator.modelContext still isn't available in this browser"); }
+});
+$("b-copydiag").addEventListener("click", async () => {
+  const json = JSON.stringify(diagnostics(), null, 2);
+  try { await navigator.clipboard.writeText(json); toast("Diagnostics copied"); }
+  catch(e){ toast("Clipboard blocked — window.maze95.diagnostics() returns the same"); }
+});
 $("b-copytools").addEventListener("click", async () => {
   const json = JSON.stringify(api.tools, null, 2);
   try { await navigator.clipboard.writeText(json); toast("Tool definitions copied"); }
@@ -2064,6 +2163,8 @@ requestAnimationFrame(frame);
 logLine("Maze 95 ready · seed " + M.seed + " · " + M.W + "x" + M.H + " · " + M.longest + " steps start to exit");
 logLine("Standing by — nothing moves until a player or an agent drives it.");
 initAsk();   // resolves later, or never outside a Claude viewer
+console.info("[Maze 95] " + registered.length + " agent tools defined. Diagnostics:", diagnostics(),
+  "\nCall them here with: await window.maze95.call('maze_get_state')");
 })();
 </script>
 
