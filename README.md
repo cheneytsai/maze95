@@ -100,6 +100,7 @@ hand.
 | `maze_turn` | Quarter turns, or an absolute compass heading |
 | `maze_goto` | Shortest route to any cell |
 | `maze_solve` | Shortest route to the exit |
+| `maze_wait_for_arrival` | Block until the queued walk finishes |
 | `maze_new_maze` | Regenerate, optionally with a size or a seed |
 | `maze_set_options` | Wall, floor and ceiling styles, lighting, light range, FOV, wall height, speed, loops, overlays |
 | `maze_set_driver` | Hand the camera to the screensaver, the agent, or the player |
@@ -111,8 +112,16 @@ Four things make agent control predictable:
 
 - **Nothing moves unless asked.** No autoplay, and the screensaver never starts on its own,
   so state between two tool calls only changes if a tool changed it.
-- **Movement tools resolve when the walk lands.** Long routes animate proportionally faster
-  so a call never takes more than a few seconds, and `instant: true` skips the animation.
+- **The walk is decoupled from the tool call.** A movement tool appends its route to a
+  queue and returns in a few milliseconds; the renderer walks that queue at a pace a person
+  can watch (about 1.5 cells/second, following the Walk speed slider), turning on the spot
+  at corners. A slow agent is fine — the camera finishes and waits. A fast one is fine too:
+  a route arriving mid-walk is appended and the camera continues into it without a jump.
+  Pass `wait: true` to block until arrival, `maze_wait_for_arrival` to sync up later, or
+  `instant: true` to skip the walk when you really want a jump.
+- **Plans come from where the queue ends**, not where the camera is right now, so
+  `plannedCell`, `openings` and `canMove` describe the cell the agent will be standing in.
+  Chained relative moves therefore compose instead of all planning from the same stale spot.
 - **The maze never regenerates under an agent**, even with "New maze at exit" on. It reports
   `solved: true` and waits for `maze_new_maze`.
 - **Arguments are normalised.** Whether the host passes the arguments directly, wraps them
