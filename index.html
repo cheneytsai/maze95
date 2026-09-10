@@ -321,6 +321,7 @@ body.touch #touch{display:block}
         <dt>Cell</dt><dd id="r-cell">--,--</dd>
         <dt>Facing</dt><dd id="r-face">N</dd>
         <dt>Driver</dt><dd id="r-mode">screensaver</dd>
+        <dt>Walking</dt><dd id="r-walk">--</dd>
         <dt>Elapsed</dt><dd id="r-time">0:00</dd>
         <dt>Seed</dt><dd id="r-seed">--------</dd>
       </dl>
@@ -1117,7 +1118,9 @@ const keys = new Set();
 const driftMesh = new Mesh(whiteTex);
 
 function cellOf(px,pz){ return [clamp(Math.floor(px/CELL),0,M.W-1), clamp(Math.floor(pz/CELL),0,M.H-1)]; }
-function facing(){ return ((Math.round(cam.yaw / (Math.PI/2)) % 4) + 4) % 4; }
+/* Direction d faces yaw -d*PI/2, so reading the compass back has to negate:
+   without it east and west swap, and every relative move walks into a wall. */
+function facing(){ return ((-Math.round(cam.yaw / (Math.PI/2)) % 4) + 4) % 4; }
 const compass = () => DIRNAME[facing()];
 
 /* Textures and geometry are rebuilt on their own, so restyling the floor or the
@@ -1165,7 +1168,7 @@ function newMaze(seedText, keepPos){
       dir:Math.floor(r()*4), t:r(), spin:r()*TAU, shape:i%2,
       col:[0.35+r()*0.65, 0.35+r()*0.65, 0.45+r()*0.55] });
   }
-  nav = null; auto = { turning:0, from:0, to:0, moving:0, fx:cam.x, fz:cam.z, tx:cam.x, tz:cam.z, dir:facing() };
+  walk = null; plannedCell = null; waiters = []; auto = { turning:0, from:0, to:0, moving:0, fx:cam.x, fz:cam.z, tx:cam.x, tz:cam.z, dir:facing() };
   solved = false; startedAt = performance.now(); elapsedFrozen = 0;
   document.getElementById("r-seed").textContent = M.seed;
   document.getElementById("s-seed").value = M.seed;
@@ -1243,47 +1246,107 @@ function autoUpdate(dt){
 }
 function shortAngle(a,b){ let d = (b-a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
 
-/* ---------- agent navigation: walk a list of cells, resolve when done ----- */
-let nav = null;
-/* A tool call resolves when the walk finishes, so the walk must never make an
-   agent wait: long routes animate proportionally faster, and `instant` skips
-   the animation altogether. */
-function walkCells(cells, instant){
+/* ---------- agent navigation ---------------------------------------------
+   The walk is DECOUPLED from the tool call. A movement tool appends its route
+   to a queue and returns; the renderer walks that queue at a speed a person can
+   actually watch. So a slow agent is fine — the camera finishes walking and
+   waits — and a fast agent is fine too, because a route that arrives mid-walk
+   is appended and the camera continues into it without a jump.
+
+   Everything an agent plans is therefore computed from where the queue ENDS,
+   not from where the camera happens to be right now. -------------------------- */
+let walk = null;              // { cells, i, t, turn, from, to, steps }
+let plannedCell = null;       // the cell the camera will stand in once the queue drains
+let waiters = [];
+
+const walkCPS = () => clamp(opt.speed / 6, 0.5, 6);        // cells per second
+const TURN_RATE = 3.2;                                     // radians per second, in place
+
+function planFrom(){ return plannedCell || cellOf(cam.x, cam.z); }
+function planFacing(){
+  if (walk && walk.cells.length >= 2){
+    const n = walk.cells.length, a = walk.cells[n-2], b = walk.cells[n-1];
+    for (let d=0; d<4; d++) if (DIRS[d][0] === b[0]-a[0] && DIRS[d][1] === b[1]-a[1]) return d;
+  }
+  return facing();
+}
+function walkEta(){
+  if (!walk) return 0;
+  const left = walk.cells.length - 1 - walk.i - walk.t;
+  return +(left / walkCPS()).toFixed(1);
+}
+function queuedCells(){ return walk ? walk.cells.length - 1 - walk.i : 0; }
+
+function enqueue(cells){
+  if (!cells || cells.length < 2) return 0;
+  if (walk) walk.cells.push(...cells.slice(1));            // continue without a seam
+  else walk = { cells: cells.slice(), i:0, t:0, turn:0, from:0, to:0, steps:0 };
+  plannedCell = cells[cells.length-1];
+  mode = "agent"; syncMode();
+  return cells.length - 1;
+}
+/* resolves when the queue drains; never blocks forever */
+function arrival(timeoutMs){
+  if (!walk) return Promise.resolve({ arrived:true, steps:0 });
   return new Promise(resolve => {
-    if (!cells || cells.length < 2){ resolve({steps:0}); return; }
-    mode = "agent"; syncMode();
-    const n = cells.length - 1;
-    if (instant){
-      for (const c of cells) visited[M.idx(c[0],c[1])] = 1;
-      const last = cells[n], prev = cells[n-1];
-      cam.x = (last[0]+0.5)*CELL; cam.z = (last[1]+0.5)*CELL;
-      cam.yaw = Math.atan2(-(last[0]-prev[0]), -(last[1]-prev[1]));
-      mapDirty = true;
-      if (!solved && last[0]===M.exit[0] && last[1]===M.exit[1]) onSolved();
-      resolve({steps:n}); return;
-    }
-    nav = { cells, i:0, t:0, speed: clamp(n/3.5, 2.4, 30), resolve, steps:0 };  // ~3.5s, whatever the distance
+    const w = { resolve, timer:0 };
+    w.timer = setTimeout(() => {
+      waiters = waiters.filter(x => x !== w);
+      resolve({ arrived:false, timedOut:true, steps:walk ? walk.steps : 0 });
+    }, timeoutMs || 120000);
+    waiters.push(w);
   });
 }
-function navUpdate(dt){
-  const a = nav.cells[nav.i], b = nav.cells[nav.i+1];
+function settle(payload){
+  const list = waiters; waiters = [];
+  for (const w of list){ clearTimeout(w.timer); w.resolve(payload); }
+}
+function jump(cells){                                       // the explicit no-animation path
+  for (const c of cells) visited[M.idx(c[0],c[1])] = 1;
+  const last = cells[cells.length-1], prev = cells[cells.length-2] || last;
+  cam.x = (last[0]+0.5)*CELL; cam.z = (last[1]+0.5)*CELL;
+  if (prev !== last) cam.yaw = Math.atan2(-(last[0]-prev[0]), -(last[1]-prev[1]));
+  walk = null; plannedCell = null; mapDirty = true;
+  if (!solved && last[0]===M.exit[0] && last[1]===M.exit[1]) onSolved();
+}
+
+function walkUpdate(dt){
+  const a = walk.cells[walk.i], b = walk.cells[walk.i+1];
   const ax=(a[0]+0.5)*CELL, az=(a[1]+0.5)*CELL, bx=(b[0]+0.5)*CELL, bz=(b[1]+0.5)*CELL;
-  const want = Math.atan2(-(bx-ax), -(bz-az));      // yaw whose forward is (-sin, -cos)
-  cam.yaw += shortAngle(cam.yaw, want) * Math.min(1, dt*10);
-  nav.t += dt * nav.speed;                          // agent pace is its own, not the walk-speed slider
-  const t = Math.min(1, nav.t);
+  const want = Math.atan2(-(bx-ax), -(bz-az));              // yaw whose forward is (-sin, -cos)
+  const diff = shortAngle(cam.yaw, want);
+
+  // at a corner, stop and turn on the spot — it reads far better in first person
+  // than curving through the wall, and it is what the screensaver did
+  if (walk.turn > 0 || Math.abs(diff) > 0.7){
+    if (walk.turn <= 0){ walk.turn = 1; walk.from = cam.yaw; walk.to = cam.yaw + diff; }
+    walk.turn = Math.max(0, walk.turn - dt * TURN_RATE * (walkCPS()/2.3));
+    const t = 1 - walk.turn;
+    cam.yaw = walk.from + (walk.to - walk.from) * (t*t*(3-2*t));
+    if (walk.turn === 0) cam.yaw = walk.to;
+    return;
+  }
+  cam.yaw += diff * Math.min(1, dt*8);                      // shave the last few degrees while walking
+  walk.t += dt * walkCPS();
+  const t = Math.min(1, walk.t);
   cam.x = lerp(ax,bx,t); cam.z = lerp(az,bz,t);
-  if (t >= 1){
-    nav.t = 0; nav.i++; nav.steps++;
-    const i = M.idx(b[0],b[1]); if (!visited[i]){ visited[i]=1; mapDirty=true; }
-    if (!solved && b[0]===M.exit[0] && b[1]===M.exit[1]) onSolved();
-    if (nav.i >= nav.cells.length-1){
-      cam.yaw = want; const r = nav.resolve, s = nav.steps; nav = null; r({steps:s});
-    }
+  if (t < 1) return;
+
+  walk.t = 0; walk.i++; walk.steps++;
+  const i = M.idx(b[0],b[1]); if (!visited[i]){ visited[i]=1; mapDirty=true; }
+  if (!solved && b[0]===M.exit[0] && b[1]===M.exit[1]) onSolved();
+  if (walk.i >= walk.cells.length - 1){                     // queue drained
+    cam.yaw = want;
+    const steps = walk.steps;
+    walk = null; plannedCell = null;
+    settle({ arrived:true, steps });
   }
 }
-function stopNav(reason){
-  if (nav){ const r = nav.resolve, s = nav.steps; nav = null; r({steps:s, interrupted:reason||"stopped"}); }
+function stopWalk(reason){
+  if (!walk) return;
+  const steps = walk.steps;
+  walk = null; plannedCell = null;
+  settle({ arrived:false, interrupted: reason || "stopped", steps });
 }
 
 function onSolved(){
@@ -1356,16 +1419,16 @@ function frame(now){
   resize();
 
   // --- update -------------------------------------------------------------
-  if (nav) navUpdate(dt);
+  if (walk) walkUpdate(dt);
   else if (mode === "auto") autoUpdate(dt);
   else humanUpdate(dt);                          // "ready" is this, with no keys down
 
   // the screensaver only ever starts on request, and never interrupts an agent
-  if (mode === "human" && !nav && opt.idle > 0 && (now - lastInput)/1000 > opt.idle){
+  if (mode === "human" && !walk && opt.idle > 0 && (now - lastInput)/1000 > opt.idle){
     setMode("auto"); toast("Screensaver started");
   }
 
-  const moving = (mode==="auto" && auto.moving>0) || nav || (mode==="human" && movingNow);
+  const moving = (mode==="auto" && auto.moving>0) || walk || (mode==="human" && movingNow);
   if (opt.bob && moving) cam.bob += dt * 7 * (opt.speed/14);
   const bobY = (opt.bob && moving) ? Math.sin(cam.bob)*0.16 : 0;
 
@@ -1487,12 +1550,12 @@ function syncMode(){
 /* =========================  INPUT  ======================================= */
 addEventListener("keydown", e => {
   const k = e.key.toLowerCase();
-  if (k === "escape"){ stopNav("stopped"); setMode("ready"); return; }
+  if (k === "escape"){ stopWalk("stopped"); setMode("ready"); return; }
   if (["w","a","s","d","q","e","arrowup","arrowdown","arrowleft","arrowright","shift"].includes(k)){
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
     e.preventDefault();
     keys.add(k); lastInput = performance.now();
-    if (mode !== "human"){ stopNav("player took over"); setMode("human"); }
+    if (mode !== "human"){ stopWalk("player took over"); setMode("human"); }
   }
   if (k === "n" && !e.metaKey && !e.ctrlKey && e.target.tagName !== "INPUT"){ newMaze(null); toast("New maze"); }
   if (k === "tab" && e.target.tagName !== "INPUT" && e.target.tagName !== "SELECT"){
@@ -1505,7 +1568,7 @@ addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
 addEventListener("blur", () => keys.clear());
 
 canvas.addEventListener("mousedown", () => {
-  stopNav("player took over"); setMode("human");
+  stopWalk("player took over"); setMode("human");
   if (canvas.requestPointerLock) canvas.requestPointerLock();
 });
 document.addEventListener("pointerlockchange", () => {
@@ -1524,7 +1587,7 @@ const stick = document.getElementById("stick"), nub = document.getElementById("n
 let stickId = null, lookId = null, lookLast = null;
 if (matchMedia("(pointer:coarse)").matches) document.body.classList.add("touch");
 stick.addEventListener("pointerdown", e => { stickId = e.pointerId; stick.setPointerCapture(e.pointerId);
-  stopNav("player took over"); setMode("human"); moveStick(e); });
+  stopWalk("player took over"); setMode("human"); moveStick(e); });
 stick.addEventListener("pointermove", e => { if (e.pointerId === stickId) moveStick(e); });
 const endStick = e => { if (e.pointerId === stickId){ stickId = null; touchVec = {x:0,y:0}; nub.style.transform = ""; } };
 stick.addEventListener("pointerup", endStick); stick.addEventListener("pointercancel", endStick);
@@ -1538,7 +1601,7 @@ function moveStick(e){
   lastInput = performance.now();
 }
 canvas.addEventListener("pointerdown", e => { if (e.pointerType !== "touch") return;
-  lookId = e.pointerId; lookLast = {x:e.clientX, y:e.clientY}; stopNav("player took over"); setMode("human"); });
+  lookId = e.pointerId; lookLast = {x:e.clientX, y:e.clientY}; stopWalk("player took over"); setMode("human"); });
 canvas.addEventListener("pointermove", e => {
   if (e.pointerId !== lookId || !lookLast) return;
   cam.yaw -= (e.clientX - lookLast.x) * opt.sens/900;
@@ -1559,6 +1622,7 @@ function updateReadout(){
   $("r-cell").textContent = cx + "," + cz;
   $("r-face").textContent = compass().slice(0,1).toUpperCase() + compass().slice(1);
   $("r-time").textContent = fmtTime(solved ? elapsedFrozen : performance.now()-startedAt);
+  $("r-walk").textContent = walk ? queuedCells() + " cells · " + walkEta() + "s" : "--";
   const d = new Date();
   $("t-clock").textContent = String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0");
 }
@@ -1600,7 +1664,7 @@ $("b-full").addEventListener("click", () => {
 $("b-regen").addEventListener("click", () => { newMaze(null); toast("New maze · seed " + M.seed); });
 $("b-regen2").addEventListener("click", () => { newMaze(null); toast("New maze · seed " + M.seed); });
 $("b-replay").addEventListener("click", () => { newMaze(M.seed); toast("Back to the start of " + M.seed); });
-$("b-auto").addEventListener("click", () => { stopNav("mode changed"); setMode(mode === "auto" ? "ready" : "auto"); });
+$("b-auto").addEventListener("click", () => { stopWalk("mode changed"); setMode(mode === "auto" ? "ready" : "auto"); });
 $("b-classic").addEventListener("click", () => {
   Object.assign(opt, CLASSIC); saveOpts(); syncControls(); restyle(); applyAll();
   toast("Classic 95 · brick, grey, no exit, no end");
@@ -1655,16 +1719,19 @@ $("s-seed").addEventListener("change", e => {
    structured payload, and every call is echoed into the on-screen log.      */
 function state(extra){
   const [cx,cz] = cellOf(cam.x,cam.z), f = facing();
+  const [px,pz] = planFrom(), pf = planFacing();   // openings describe where the agent will BE
   const openings = {};
-  for (let d=0; d<4; d++) openings[DIRNAME[d]] = !M.wall(cx,cz,d);
+  for (let d=0; d<4; d++) openings[DIRNAME[d]] = !M.wall(px,pz,d);
   const rel = {
-    forward: !M.wall(cx,cz,f), back: !M.wall(cx,cz,(f+2)%4),
-    left: !M.wall(cx,cz,(f+3)%4), right: !M.wall(cx,cz,(f+1)%4)
+    forward: !M.wall(px,pz,pf), back: !M.wall(px,pz,(pf+2)%4),
+    left: !M.wall(px,pz,(pf+3)%4), right: !M.wall(px,pz,(pf+1)%4)
   };
-  const path = findPath(M,[cx,cz],M.exit);
+  const path = findPath(M,[px,pz],M.exit);
   return Object.assign({
     seed:M.seed, size:{width:M.W, height:M.H},
     cell:{x:cx, z:cz}, facing:DIRNAME[f],
+    walking: !!walk, cellsQueued: queuedCells(), etaSeconds: walkEta(),
+    plannedCell:{x:px, z:pz}, plannedFacing:DIRNAME[pf],
     start:{x:M.start[0], z:M.start[1]}, exit:{x:M.exit[0], z:M.exit[1]},
     openings, canMove:rel,
     stepsToExit: path ? path.length-1 : null,
@@ -1701,7 +1768,7 @@ function asciiMap(revealAll){
   return rows.join("\n");
 }
 function describeView(){
-  const [cx,cz] = cellOf(cam.x,cam.z), f = facing();
+  const [cx,cz] = planFrom(), f = planFacing();
   let x = cx, z = cz, len = 0, side = [];
   while (!M.wall(x,z,f) && len < 40){
     x += DIRS[f][0]; z += DIRS[f][1]; len++;
@@ -1715,6 +1782,22 @@ function describeView(){
         if (ex===M.exit[0] && ez===M.exit[1]) return {cellsAhead:i+1}; }
       return false; })() };
 }
+
+/* Movement tools all come through here. By default they return as soon as the
+   walk is under way, so the agent is never blocked for the length of a corridor
+   and the viewer watches the camera walk it. Pass wait:true to block until
+   arrival, or instant:true to skip the walk entirely. */
+async function drive(cells, a){
+  if (!cells || cells.length < 2) return { steps:0, arrived:true, walking:false };
+  if (a && a.instant){ jump(cells); return { steps:cells.length-1, arrived:true, walking:false }; }
+  const steps = enqueue(cells);
+  if (a && a.wait) return Object.assign({ steps }, await arrival(((a.timeoutSeconds) || 120) * 1000));
+  return { steps, arrived:false, walking:true, etaSeconds:walkEta() };
+}
+const MOVE_ARGS = {
+  wait:{type:"boolean", description:"Block until the camera arrives instead of returning while it walks (default false)"},
+  instant:{type:"boolean", description:"Skip the walk and arrive at once. The viewer sees a jump, so prefer leaving this off"}
+};
 
 const TOOLS = [
   { name:"maze_get_state",
@@ -1734,17 +1817,17 @@ const TOOLS = [
                  width:M.W, height:M.H, seed:M.seed }) },
 
   { name:"maze_move",
-    description:"Walk whole cells relative to the current heading. Stops early at a wall and reports how far it got.",
+    description:"Walk whole cells relative to the current heading, at a pace the viewer can watch. Returns while the camera is still walking; call again to queue more and the walk continues without a jump. Stops early at a wall and reports how far it got.",
     inputSchema:{ type:"object", properties:{
         direction:{type:"string", enum:["forward","back","left","right"], description:"Direction relative to the current heading"},
         cells:{type:"integer", minimum:1, maximum:64, description:"How many cells to walk (default 1)"},
-        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
+        wait:MOVE_ARGS.wait, instant:MOVE_ARGS.instant
       }, required:["direction"], additionalProperties:false },
     run: async a => {
-      const f = facing();
+      const f = planFacing();                       // plan from the end of the queue
       const d = a.direction==="forward" ? f : a.direction==="back" ? (f+2)%4
               : a.direction==="left" ? (f+3)%4 : (f+1)%4;
-      let [x,z] = cellOf(cam.x,cam.z);
+      let [x,z] = planFrom();
       const cells = [[x,z]];
       const want = Math.max(1, Math.min(64, a.cells || 1));
       let moved = 0, stoppedBy = null;
@@ -1752,8 +1835,8 @@ const TOOLS = [
         if (M.wall(x,z,d)){ stoppedBy = "wall"; break; }
         x += DIRS[d][0]; z += DIRS[d][1]; cells.push([x,z]); moved++;
       }
-      if (moved) await walkCells(cells, !!a.instant);
-      return state({ requested:want, moved, stoppedBy, movedDirection:DIRNAME[d] });
+      const r = await drive(cells, a);
+      return state(Object.assign({ requested:want, moved, stoppedBy, movedDirection:DIRNAME[d] }, r));
     } },
 
   { name:"maze_turn",
@@ -1770,7 +1853,7 @@ const TOOLS = [
       else if (a && a.turn === "right") d = (f+1)%4;
       else if (a && a.turn === "around") d = (f+2)%4;
       else throw new Error("Pass either turn (left/right/around) or heading (north/east/south/west).");
-      stopNav("turning"); mode = "agent"; syncMode();
+      stopWalk("turning"); mode = "agent"; syncMode();
       const target = -d*Math.PI/2;
       await animate(400, t => { cam.yaw = cam.yaw + shortAngle(cam.yaw, target)*t; });
       cam.yaw = target;
@@ -1778,33 +1861,38 @@ const TOOLS = [
     } },
 
   { name:"maze_goto",
-    description:"Walk the shortest route to a given cell, turning corners on the way. Coordinates are zero-based, x across and z down, matching maze_get_map.",
+    description:"Walk the shortest route to a given cell, turning corners on the way, at a pace the viewer can watch. Routes are planned from where the camera will be once any queued walk finishes, so calls chain smoothly. Coordinates are zero-based, x across and z down, matching maze_get_map.",
     inputSchema:{ type:"object", properties:{
         x:{type:"integer", minimum:0, description:"Target column"},
         z:{type:"integer", minimum:0, description:"Target row"},
-        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
+        wait:MOVE_ARGS.wait, instant:MOVE_ARGS.instant
       }, required:["x","z"], additionalProperties:false },
     run: async a => {
       const x = clamp(a.x|0, 0, M.W-1), z = clamp(a.z|0, 0, M.H-1);
-      const path = findPath(M, cellOf(cam.x,cam.z), [x,z]);
+      const path = findPath(M, planFrom(), [x,z]);
       if (!path) throw new Error(`No route to ${x},${z} — that cell is walled off.`);
-      stopNav("new route");
-      const r = await walkCells(path, !!a.instant);
-      return state({ routeLength:path.length-1, stepsWalked:r.steps, arrived:!r.interrupted });
+      const r = await drive(path, a);
+      return state(Object.assign({ routeLength:path.length-1 }, r));
     } },
 
   { name:"maze_solve",
-    description:"Walk the shortest route from where the player is standing to the exit portal.",
+    description:"Walk the shortest route to the exit portal, at a pace the viewer can watch. Returns while the camera is still walking unless you pass wait:true; either way the walk finishes on its own.",
     inputSchema:{ type:"object", properties:{
-        instant:{type:"boolean", description:"Skip the walking animation and arrive immediately (default false)"}
+        wait:MOVE_ARGS.wait, instant:MOVE_ARGS.instant
       }, additionalProperties:false },
     run: async a => {
-      const path = findPath(M, cellOf(cam.x,cam.z), M.exit);
+      const path = findPath(M, planFrom(), M.exit);
       if (!path) throw new Error("No route to the exit from here.");
-      stopNav("solving");
-      const r = await walkCells(path, !!(a && a.instant));
-      return state({ routeLength:path.length-1, stepsWalked:r.steps, reachedExit:solved });
+      const r = await drive(path, a);
+      return state(Object.assign({ routeLength:path.length-1, reachedExit:solved }, r));
     } },
+
+  { name:"maze_wait_for_arrival",
+    description:"Wait until the camera finishes the walk already queued, then report where it ended up. Use it when you want to look around or decide only once it has actually arrived.",
+    inputSchema:{ type:"object", properties:{
+        timeoutSeconds:{type:"number", minimum:1, maximum:300, description:"Give up waiting after this long (default 120)"}
+      }, additionalProperties:false },
+    run: async a => state(await arrival(((a && a.timeoutSeconds) || 120) * 1000)) },
 
   { name:"maze_new_maze",
     description:"Generate a fresh maze. Optionally set the grid size or pass a seed to reproduce a specific maze.",
@@ -1813,7 +1901,7 @@ const TOOLS = [
         seed:{type:"string", description:"Reuse a seed to get the same maze back"}
       }, additionalProperties:false },
     run: a => {
-      stopNav("new maze");
+      stopWalk("new maze");
       if (a && a.size){ opt.size = clamp(a.size|0,6,32); saveOpts(); syncControls(); }
       newMaze(a && a.seed ? String(a.seed).toUpperCase() : null);
       return state({ generated:true });
@@ -1861,7 +1949,7 @@ const TOOLS = [
         driver:{type:"string", enum:["stop","screensaver","agent","player"], description:"stop leaves the camera still and waiting, screensaver runs the automatic wall follower, agent holds it for tool-driven moves, player hands control to the keyboard"}
       }, required:["driver"], additionalProperties:false },
     run: a => {
-      stopNav("driver changed");
+      stopWalk("driver changed");
       setMode(a.driver === "screensaver" ? "auto" : a.driver === "player" ? "human"
             : a.driver === "stop" ? "ready" : "agent");
       return state();
